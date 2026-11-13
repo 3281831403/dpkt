@@ -8,6 +8,16 @@ from . import dpkt
 from .compat import BytesIO, iteritems
 
 
+def _parse_header_line(line):
+    """Split one 'name: value' header line into a lowercase (key, value)."""
+    l_ = line.split(':', 1)
+    if len(l_[0].split()) != 1:
+        raise dpkt.UnpackError('invalid header: %r' % line)
+    k = l_[0].lower()
+    v = len(l_) != 1 and l_[1].lstrip() or ''
+    return k, v
+
+
 def parse_headers(f):
     """Return dict of HTTP headers parsed from a file object."""
     d = OrderedDict()
@@ -22,12 +32,7 @@ def parse_headers(f):
         line = f.readline().strip().decode("ascii", "ignore")
         if not line:
             break
-        l_ = line.split(':', 1)
-        if len(l_[0].split()) != 1:
-            raise dpkt.UnpackError('invalid header: %r' % line)
-
-        k = l_[0].lower()
-        v = len(l_) != 1 and l_[1].lstrip() or ''
+        k, v = _parse_header_line(line)
         if k in d:
             if not type(d[k]) is list:
                 d[k] = [d[k]]
@@ -37,47 +42,238 @@ def parse_headers(f):
     return d
 
 
-def parse_body(f, headers):
-    """Return HTTP body parsed from a file object, given HTTP header dict."""
-    if headers.get('transfer-encoding', '').lower() == 'chunked':
-        l_ = []
-        found_end = False
-        while 1:
-            try:
-                sz = f.readline().split(None, 1)[0]
-            except IndexError:
-                raise dpkt.UnpackError('missing chunk size')
-            try:
-                n = int(sz, 16)
-            except ValueError:
-                raise dpkt.UnpackError('invalid chunk size')
+def _header_values(headers, name):
+    """Return every raw value of a possibly repeated/comma-listed header."""
+    value = headers.get(name)
+    if value is None:
+        return []
+    values = value if isinstance(value, list) else [value]
+    # RFC 7230 allows equivalent values to be combined into a comma list,
+    # e.g. 'Content-Length: 1, 1'.
+    out = []
+    for v in values:
+        out.extend(part for part in v.split(','))
+    return out
 
-            if n == 0:
-                found_end = True
-            buf = f.read(n)
-            if f.readline().strip():
-                break
 
-            if n and len(buf) == n:
-                l_.append(buf)
-            else:
-                # only possible when len(buf) < n, which will happen if the
-                # file object ends before reading a complete file chunk
-                break
-        if not found_end:
-            raise dpkt.NeedData('premature end of chunked body')
-        body = b''.join(l_)
-    elif 'content-length' in headers:
-        n = int(headers['content-length'])
-        body = f.read(n)
-        if len(body) != n:
-            raise dpkt.NeedData('short body (missing %d bytes)' % (n - len(body)))
+def _parse_trailers(f):
+    """Parse the trailer header block following the last (zero-sized) chunk."""
+    trailers = OrderedDict()
+    while 1:
+        line = f.readline()
+        # A trailer block is terminated by an empty line. Tolerate a bare LF
+        # when the preceding chunk data happened to end in CR (the terminating
+        # CRLF's CR was then consumed together with the chunk data).
+        if line in (b'\r\n', b'\n', b''):
+            break
+        line = line.strip().decode("ascii", "ignore")
+        if not line:
+            break
+        k, v = _parse_header_line(line)
+        if k in trailers:
+            if not type(trailers[k]) is list:
+                trailers[k] = [trailers[k]]
+            trailers[k].append(v)
+        else:
+            trailers[k] = v
+    return trailers
+
+
+def _read_chunk_terminator(f):
+    """Consume the CRLF that ends one chunk.
+
+    A chunk whose own data ends in CR/LF can leave the boundary line as a
+    bare CR or bare LF; only a non-empty line means the stream no longer
+    follows the chunk framing (historical tolerance preserved). Returns
+    ``False`` when framing has been lost.
+    """
+    return not f.readline().strip()
+
+
+def _parse_chunked(f):
+    """Parse a chunked transfer-coded body (RFC 7230 section 4.1).
+
+    Returns ``(body, trailers)``. Chunk extensions on the chunk-size line are
+    tolerated and discarded, and the trailer block is parsed on its own
+    instead of being left in the stream. Error types and messages match the
+    historical parser.
+    """
+    chunks = []
+    found_end = False
+    trailers = OrderedDict()
+    while 1:
+        try:
+            sz = f.readline().split(None, 1)[0]
+        except IndexError:
+            raise dpkt.UnpackError('missing chunk size')
+        # A chunk-size line may carry chunk extensions after a semicolon,
+        # e.g. '4; name="value"'.
+        try:
+            n = int(sz.split(b';', 1)[0], 16)
+        except ValueError:
+            raise dpkt.UnpackError('invalid chunk size')
+
+        buf = f.read(n)
+        if not _read_chunk_terminator(f):
+            break
+
+        if n == 0:
+            # Only now does the (possibly empty) trailer block begin.
+            found_end = True
+            trailers = _parse_trailers(f)
+            break
+
+        if len(buf) == n:
+            chunks.append(buf)
+        else:
+            # only possible when len(buf) < n, which will happen if the
+            # file object ends before reading a complete file chunk
+            break
+    if not found_end:
+        raise dpkt.NeedData('premature end of chunked body')
+    return b''.join(chunks), trailers
+
+
+class Framing(object):
+    """Framing decision for a single HTTP message.
+
+    A ``Framing`` instance is attached to every parsed :class:`Message` as
+    ``msg.framing`` and records *how* the body was split out of the byte
+    stream, including interpretations that were not adopted, so ambiguous
+    messages can be triaged without manual byte counting.
+
+    Attributes:
+        method: framing actually used to split out the body; one of
+            ``'content-length'``, ``'chunked'``, ``'read-to-end'`` (the
+            legacy Content-Type fallback that consumes the whole stream) or
+            ``'none'`` (no body allowed / no framing header).
+        ambiguous: ``True`` when the framing information on the wire is
+            conflicting: duplicate Content-Length headers with different
+            values, or Content-Length together with Transfer-Encoding.
+        transfer_encoding: the effective Transfer-Encoding header value, or
+            ``None``.
+        content_length: the effective Content-Length value used for framing,
+            or ``None``.
+        content_length_values: every integer Content-Length value found on
+            the wire (duplicate headers and comma lists included).
+        body: the body accepted by the parser; identical to ``Message.body``.
+        trailers: trailer header block of a chunked message (may be empty).
+        body_by_content_length: ``(body, remaining)`` computed by splitting at
+            the first Content-Length value, or ``None`` when no
+            Content-Length is present.
+        body_by_chunked: ``(body, trailers, remaining)`` computed by parsing
+            the chunked transfer coding, or ``None`` when chunked coding is
+            not in effect.
+        remaining: bytes left after this message; identical to
+            ``Message.data``. Feed it back into :class:`Request` or
+            :class:`Response` to walk pipelined messages on one connection.
+    """
+
+    def __init__(self):
+        self.method = None
+        self.ambiguous = False
+        self.transfer_encoding = None
+        self.content_length = None
+        self.content_length_values = []
+        self.body = b''
+        self.trailers = OrderedDict()
+        self.body_by_content_length = None
+        self.body_by_chunked = None
+        self.remaining = b''
+
+
+def _content_length_cut(f, n):
+    """Split ``(body, remaining)`` at ``n`` bytes from the current position."""
+    body = f.read(n)
+    return body, f.read()
+
+
+def _frame_body(f, headers, is_body_allowed=True):
+    """Decide how one HTTP message is framed and parse its body.
+
+    The file object is consumed up to the end of the accepted message so the
+    caller can read pipelined messages from the remainder.
+    """
+    framing = Framing()
+    if not is_body_allowed:
+        framing.method = 'none'
+        framing.remaining = f.read()
+        return framing
+
+    cl_values = []
+    for raw in _header_values(headers, 'content-length'):
+        raw = raw.strip()
+        try:
+            n = int(raw)
+        except ValueError:
+            raise dpkt.UnpackError('invalid content-length: %r' % raw)
+        if n < 0:
+            raise dpkt.UnpackError('invalid content-length: %r' % raw)
+        cl_values.append(n)
+    framing.content_length_values = cl_values
+
+    distinct_cl = []
+    for n in cl_values:
+        if n not in distinct_cl:
+            distinct_cl.append(n)
+    # RFC 7230 3.3.2: duplicate Content-Length with differing values is an
+    # unrecoverable framing error; flag it instead of crashing on int(list).
+    if len(distinct_cl) > 1:
+        framing.ambiguous = True
+
+    te_values = _header_values(headers, 'transfer-encoding')
+    te = te_values[-1].strip() if te_values else ''
+    framing.transfer_encoding = te or None
+    chunked = te.lower() == 'chunked'
+    # RFC 7230 3.3.3: senders MUST NOT send both; a tolerant parser ignores
+    # Content-Length and frames by the chunked transfer coding.
+    if chunked and cl_values:
+        framing.ambiguous = True
+
+    start = f.tell()
+
+    # Content-Length interpretation, computed whenever a CL is present even
+    # when another framing ends up being adopted.
+    if cl_values:
+        f.seek(start)
+        framing.body_by_content_length = _content_length_cut(f, cl_values[0])
+
+    # Chunked interpretation (also the accepted pass when chunked is in use).
+    if chunked:
+        f.seek(start)
+        body, trailers = _parse_chunked(f)
+        framing.body_by_chunked = (body, trailers, f.read())
+
+    if chunked:
+        framing.method = 'chunked'
+        framing.body = body
+        framing.trailers = trailers
+        framing.remaining = framing.body_by_chunked[2]
+    elif cl_values:
+        framing.method = 'content-length'
+        framing.content_length = cl_values[0]
+        framing.body, framing.remaining = framing.body_by_content_length
+        if len(framing.body) != cl_values[0]:
+            raise dpkt.NeedData('short body (missing %d bytes)'
+                                % (cl_values[0] - len(framing.body)))
     elif 'content-type' in headers:
-        body = f.read()
+        framing.method = 'read-to-end'
+        f.seek(start)
+        framing.body = f.read()
     else:
-        # XXX - need to handle HTTP/0.9
-        body = b''
-    return body
+        framing.method = 'none'
+        f.seek(start)
+        framing.remaining = f.read()
+    return framing
+
+
+def parse_body(f, headers):
+    """Return HTTP body parsed from a file object, given HTTP header dict.
+
+    Backwards-compatible wrapper around the framing analysis; see
+    :class:`Framing` for the full ambiguity/trailer breakdown.
+    """
+    return _frame_body(f, headers).body
 
 
 class Message(dpkt.Packet):
@@ -97,6 +293,8 @@ class Message(dpkt.Packet):
     __hdr_defaults__ = {}
     headers = None
     body = None
+    framing = None
+    trailers = None
 
     def __init__(self, *args, **kwargs):
         if args:
@@ -105,6 +303,8 @@ class Message(dpkt.Packet):
             self.headers = OrderedDict()
             self.body = b''
             self.data = b''
+            self.framing = Framing()
+            self.trailers = self.framing.trailers
             # NOTE: changing this to iteritems breaks py3 compatibility
             for k, v in self.__hdr_defaults__.items():
                 setattr(self, k, v)
@@ -115,13 +315,14 @@ class Message(dpkt.Packet):
         f = BytesIO(buf)
         # Parse headers
         self.headers = parse_headers(f)
-        # Parse body
-        if is_body_allowed:
-            self.body = parse_body(f, self.headers)
-        else:
-            self.body = b''
+        # Decide how the message is framed and parse the body. The framing
+        # object also carries the alternative cuts, trailers and ambiguity
+        # verdict for security triage.
+        self.framing = _frame_body(f, self.headers, is_body_allowed)
+        self.body = self.framing.body
+        self.trailers = self.framing.trailers
         # Save the rest
-        self.data = f.read()
+        self.data = self.framing.remaining
 
     def pack_hdr(self):
         return ''.join(['%s: %s\r\n' % t for t in iteritems(self.headers)])
@@ -592,3 +793,170 @@ def test_parse_body():
     }
     with pytest.raises(dpkt.NeedData, match="premature end of chunked body"):
         parse_body(buf, headers)
+
+
+def test_duplicate_content_length():
+    import pytest
+    # Repeated identical Content-Length: valid, not ambiguous, no TypeError.
+    s = (b'POST / HTTP/1.1\r\nContent-Length: 5\r\nContent-Length: 5\r\n\r\n'
+         b'hello')
+    r = Request(s)
+    assert r.body == b'hello'
+    assert r.framing.method == 'content-length'
+    assert r.framing.ambiguous is False
+    assert r.framing.content_length_values == [5, 5]
+    assert r.framing.body_by_content_length == (b'hello', b'')
+    assert r.data == b''
+
+    # Conflicting Content-Length values used to raise TypeError; now the
+    # message still parses and is explicitly flagged ambiguous. The first
+    # value is the adopted cut, every value is recorded.
+    s = (b'POST / HTTP/1.1\r\nContent-Length: 5\r\nContent-Length: 7\r\n\r\n'
+         b'hello!!REST')
+    r = Request(s)
+    assert r.framing.ambiguous is True
+    assert r.framing.method == 'content-length'
+    assert r.framing.content_length_values == [5, 7]
+    assert r.framing.content_length == 5
+    assert r.body == b'hello'
+    # The CL cut reports both the body and the bytes left over by that cut.
+    assert r.framing.body_by_content_length == (b'hello', b'!!REST')
+    assert r.data == b'!!REST'
+
+    # Comma-combined duplicate values are handled the same way.
+    s = b'POST / HTTP/1.1\r\nContent-Length: 5, 7\r\n\r\nhello!!REST'
+    r = Request(s)
+    assert r.framing.ambiguous is True
+    assert r.framing.content_length_values == [5, 7]
+
+    # A non-numeric Content-Length is a dpkt error, not a raw ValueError.
+    with pytest.raises(dpkt.UnpackError, match='invalid content-length'):
+        Request(b'POST / HTTP/1.1\r\nContent-Length: abc\r\n\r\nx')
+
+
+def test_content_length_and_transfer_encoding():
+    # Both headers present: ambiguous, chunked transfer coding is adopted
+    # (RFC 7230 3.3.3), and both interpretations are reported separately.
+    after_headers = b'5\r\nhello\r\n0\r\n\r\n\r\nGET /next HTTP/1.1\r\n\r\n'
+    s = (b'POST / HTTP/1.1\r\nContent-Length: 7\r\n'
+         b'Transfer-Encoding: chunked\r\n\r\n' + after_headers)
+    r = Request(s)
+
+    assert r.framing.ambiguous is True
+    assert r.framing.method == 'chunked'
+    assert r.framing.transfer_encoding == 'chunked'
+    assert r.framing.content_length_values == [7]
+
+    # Adopted chunked cut: decoded body, trailers and remaining bytes.
+    assert r.body == b'hello'
+    assert r.trailers == OrderedDict()
+    assert r.framing.body_by_chunked == (
+        b'hello', OrderedDict(), b'GET /next HTTP/1.1\r\n\r\n')
+    assert r.data == b'GET /next HTTP/1.1\r\n\r\n'
+
+    # Alternative Content-Length cut over the same raw bytes.
+    cl_body, cl_remaining = r.framing.body_by_content_length
+    assert cl_body == after_headers[:7]
+    assert cl_remaining == after_headers[7:]
+    assert cl_body + cl_remaining == after_headers
+
+    # The remaining bytes are themselves a parseable message, i.e. the
+    # connection can be walked without re-splitting by hand.
+    nxt = Request(r.data)
+    assert nxt.uri == '/next'
+
+
+def test_chunk_extensions():
+    # Chunk extensions ('4; foo=bar') must not break chunk-size decoding.
+    s = (b'HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n'
+         b'4; foo=bar\r\nwiki\r\n'
+         b'5; a=1; b=2\r\npedia\r\n'
+         b'0\r\n\r\n')
+    r = Response(s)
+    assert r.body == b'wikipedia'
+    assert r.framing.method == 'chunked'
+    assert r.framing.ambiguous is False
+    assert r.trailers == OrderedDict()
+    assert r.data == b''
+    assert bytes(Response(s)) == (
+        b'HTTP/1.1 200 OK\r\ntransfer-encoding: chunked\r\n\r\nwikipedia')
+
+
+def test_chunked_trailers():
+    # The trailer block is parsed on its own instead of leaking into data,
+    # so the next message on the connection starts at the right byte.
+    s = (b'HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n'
+         b'4\r\nwiki\r\n5\r\npedia\r\n'
+         b'0\r\n\r\nETag: "x"\r\nX-Sum: 9\r\n\r\nNEXTMSG')
+    r = Response(s)
+    assert r.body == b'wikipedia'
+    assert r.trailers == OrderedDict([('etag', '"x"'), ('x-sum', '9')])
+    assert r.framing.body_by_chunked == (
+        b'wikipedia',
+        OrderedDict([('etag', '"x"'), ('x-sum', '9')]),
+        b'NEXTMSG')
+    assert r.data == b'NEXTMSG'
+
+    # Trailer headers are kept separate from ordinary message headers.
+    assert 'etag' not in r.headers
+    # Normal message serialization is unaffected: trailers are not appended.
+    assert bytes(r) == (
+        b'HTTP/1.1 200 OK\r\ntransfer-encoding: chunked\r\n\r\nwikipedia')
+
+
+def test_pipelined_messages():
+    # Several messages back to back on one connection are split in order.
+    stream = (
+        b'GET /a HTTP/1.1\r\nContent-Length: 3\r\n\r\nabc'
+        b'POST /b HTTP/1.1\r\nContent-Length: 4\r\n\r\ndefg'
+        b'GET /c HTTP/1.1\r\n\r\n'
+    )
+    parsed = []
+    while stream:
+        msg = Request(stream)
+        parsed.append((msg.method, msg.uri, msg.body, msg.framing.method))
+        stream = msg.data
+    assert parsed == [
+        ('GET', '/a', b'abc', 'content-length'),
+        ('POST', '/b', b'defg', 'content-length'),
+        ('GET', '/c', b'', 'none'),
+    ]
+
+    # Pipelining also works when an inner message is chunked with trailers.
+    stream = (
+        b'POST /a HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\n'
+        b'3\r\nfoo\r\n0\r\n\r\nX-T: v\r\n\r\n'
+        b'GET /b HTTP/1.1\r\nContent-Length: 2\r\n\r\nhi'
+    )
+    first = Request(stream)
+    assert first.body == b'foo'
+    assert first.trailers == OrderedDict([('x-t', 'v')])
+    second = Request(first.data)
+    assert second.uri == '/b'
+    assert second.body == b'hi'
+    assert second.data == b''
+
+
+def test_framing_normal_traffic_unchanged():
+    # Plain Content-Length response: method and bytes() stay exactly as before.
+    raw = (b'HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\nhello')
+    r = Response(raw)
+    assert r.framing.method == 'content-length'
+    assert r.framing.ambiguous is False
+    assert r.framing.content_length == 5
+    assert r.body == b'hello'
+    assert r.data == b''
+    # Header keys are lowercased on parse (pre-existing behavior); body bytes
+    # are preserved exactly.
+    assert bytes(r) == b'HTTP/1.1 200 OK\r\ncontent-length: 5\r\n\r\nhello'
+
+    # Legacy read-to-end fallback via Content-Type keeps working.
+    r = Response(b'HTTP/1.0 200 OK\r\nContent-Type: text/plain\r\n\r\nraw')
+    assert r.framing.method == 'read-to-end'
+    assert r.body == b'raw'
+
+    # A message built without wire bytes exposes an empty framing object.
+    r = Request()
+    assert isinstance(r.framing, Framing)
+    assert r.framing.method is None
+    assert r.trailers == OrderedDict()
