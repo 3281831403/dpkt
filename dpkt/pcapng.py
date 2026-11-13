@@ -13,6 +13,7 @@ import sys
 
 from . import dpkt
 from .compat import BytesIO, intround
+from .pcap import ReaderError, DLT_LINUX_SLL2
 
 BYTE_ORDER_MAGIC = 0x1A2B3C4D
 BYTE_ORDER_MAGIC_LE = 0x4D3C2B1A
@@ -76,9 +77,12 @@ else:
     DLT_LOOP = 108
     DLT_RAW = 12
 
+# keep in sync with pcap.dltoff so the same linktype yields the same header
+# offset in both file formats (SLL2 is only recognized by the pcap linktype
+# table, i.e. a pcapng IDB may still carry it)
 dltoff = {DLT_NULL: 4, DLT_EN10MB: 14, DLT_IEEE802: 22, DLT_ARCNET: 6,
           DLT_SLIP: 16, DLT_PPP: 4, DLT_FDDI: 21, DLT_PFLOG: 48, DLT_PFSYNC: 4,
-          DLT_LOOP: 4, DLT_LINUX_SLL: 16}
+          DLT_LOOP: 4, DLT_LINUX_SLL: 16, DLT_LINUX_SLL2: 20}
 # </copied from pcap.py>
 
 
@@ -559,9 +563,14 @@ class Writer(object):
 class Reader(object):
     """Simple pypcap-compatible pcapng file reader."""
 
+    # minimum size of a block: type (4) + length (4) + trailing length (4)
+    _BLOCK_MIN_LEN = 12
+
     def __init__(self, fileobj):
         self.name = getattr(fileobj, 'name', '<{0}>'.format(fileobj.__class__.__name__))
         self.__f = fileobj
+        # non-fatal parse problems encountered while reading the file
+        self.errors = []
 
         shb = SectionHeaderBlock()
         buf = self.__f.read(shb.__hdr_len__)
@@ -589,20 +598,47 @@ class Reader(object):
         if shb.v_major != PCAPNG_VERSION_MAJOR:
             raise ValueError('unknown pcapng version {0}.{1}'.format(shb.v_major, shb.v_minor,))
 
-        # look for a mandatory IDB
+        self.__endian = '<' if self.__le else '>'
+
+        # look for a mandatory IDB, tolerating bad blocks in between
         idb = None
         while 1:
+            offset = self.__f.tell()
             buf = self.__f.read(8)
+            if not buf:
+                break
             if len(buf) < 8:
+                # a few stray bytes: no block boundary can be derived
+                self.errors.append(ReaderError(
+                    offset, 'truncated block header: got %d bytes, expected 8' % len(buf)))
                 break
 
-            blk_type, blk_len = struct_unpack('<II' if self.__le else '>II', buf)
-            buf += self.__f.read(blk_len - 8)
+            blk_type, blk_len = struct_unpack(self.__endian + 'II', buf)
+            if blk_len < self._BLOCK_MIN_LEN:
+                # bogus block length, the next boundary cannot be located
+                self.errors.append(ReaderError(
+                    offset, 'invalid block length %d' % blk_len))
+                break
+
+            body = self.__f.read(blk_len - 8)
+            if len(body) < blk_len - 8:
+                # truncated block at EOF, nothing beyond it can be located
+                self.errors.append(ReaderError(
+                    offset,
+                    'truncated block: got %d bytes, expected %d'
+                    % (len(body) + 8, blk_len)))
+                buf += body
+                # a partial IDB still carries the linktype information
+                if blk_type == PCAPNG_BT_IDB and \
+                        len(buf) >= InterfaceDescriptionBlock.__hdr_len__:
+                    idb = self.__parse_idb_fallback(offset, buf)
+                break
+            buf += body
 
             if blk_type == PCAPNG_BT_IDB:
-                idb = (InterfaceDescriptionBlockLE(buf) if self.__le
-                       else InterfaceDescriptionBlock(buf))
-                break
+                idb = self.__parse_idb(offset, buf)
+                if idb is not None:
+                    break
             # just skip other blocks
 
         if idb is None:
@@ -633,6 +669,27 @@ class Reader(object):
         self.snaplen = idb.snaplen
         self.filter = ''
         self.__iter = iter(self)
+
+    def __parse_idb(self, offset, buf):
+        """Parse an IDB, falling back to its fixed header when its options
+        or trailing length field are corrupt. Returns None if nothing usable
+        could be recovered."""
+        try:
+            return InterfaceDescriptionBlockLE(buf) if self.__le else InterfaceDescriptionBlock(buf)
+        except (dpkt.NeedData, dpkt.UnpackError, UnicodeDecodeError) as e:
+            self.errors.append(ReaderError(offset, 'corrupt IDB: %s' % e))
+            return self.__parse_idb_fallback(offset, buf)
+
+    def __parse_idb_fallback(self, offset, buf):
+        """Build a minimal IDB from the fixed header, ignoring options."""
+        if len(buf) < InterfaceDescriptionBlock.__hdr_len__:
+            self.errors.append(
+                ReaderError(offset, 'IDB too short to recover linktype'))
+            return None
+        idb = InterfaceDescriptionBlockLE() if self.__le else InterfaceDescriptionBlock()
+        idb.unpack_hdr(buf)
+        idb.opts = []
+        return idb
 
     @property
     def fd(self):
@@ -684,26 +741,130 @@ class Reader(object):
     def loop(self, callback, *args):
         self.dispatch(0, callback, *args)
 
+    # size of the fixed EPB/PB body fields; pkt_data starts at file offset
+    # block_offset + 8 (block hdr) + 20
+    _EPB_FIXED_HDR_LEN = 20
+    _SPB_FIXED_HDR_LEN = 4
+
+    def __read_block(self):
+        """Read one whole block.
+
+        Returns (offset, blk_type, blk_len, buf, fatal). On a fatal problem
+        (unrecoverable boundary) ``fatal`` is True and iteration must stop.
+        """
+        offset = self.__f.tell()
+        hdr = self.__f.read(8)
+        if not hdr:
+            return None
+        if len(hdr) < 8:
+            self.errors.append(ReaderError(
+                offset, 'truncated block header: got %d bytes, expected 8' % len(hdr)))
+            return offset, 0, 0, hdr, True
+
+        blk_type, blk_len = struct_unpack(self.__endian + 'II', hdr)
+        if blk_len < self._BLOCK_MIN_LEN:
+            self.errors.append(ReaderError(
+                offset, 'invalid block length %d' % blk_len))
+            # the block type cannot be trusted and no next boundary exists
+            return offset, 0, blk_len, hdr, True
+
+        body = self.__f.read(blk_len - 8)
+        buf = hdr + body
+        if len(buf) < blk_len:
+            self.errors.append(ReaderError(
+                offset,
+                'truncated block: got %d bytes, expected %d' % (len(buf), blk_len)))
+            return offset, blk_type, blk_len, buf, True
+        return offset, blk_type, blk_len, buf, False
+
+    def __ts_from_fields(self, ts_high, ts_low):
+        return self._tsoffset + (((ts_high << 32) | ts_low) / self._divisor)
+
+    def __salvage_packet(self, offset, buf, already_recorded=False):
+        """Recover (ts, pkt_data) from an EPB/PB whose options or trailing
+        length field are corrupt. The fixed header and packet data come
+        before the options, so they remain trustworthy. Returns None when
+        the buffer does not even contain the fixed header."""
+        # block hdr (8) + iface_id/ts/ts/caplen/pktlen (20)
+        if len(buf) < 8 + self._EPB_FIXED_HDR_LEN:
+            if not already_recorded:
+                self.errors.append(ReaderError(
+                    offset, 'packet block too short to recover (%d bytes)' % len(buf)))
+            return None
+        endian = self.__endian
+        # fixed body layout (same for EPB and PB, after the 8-byte block hdr):
+        # iface_id(4) ts_high(4) ts_low(4) caplen(4) pkt_len(4)
+        ts_high = struct_unpack(endian + 'I', buf[12:16])[0]
+        ts_low = struct_unpack(endian + 'I', buf[16:20])[0]
+        caplen = struct_unpack(endian + 'I', buf[24:28])[0]
+        po = 8 + self._EPB_FIXED_HDR_LEN
+        pkt_data = buf[po:min(po + caplen, len(buf))]
+        return self.__ts_from_fields(ts_high, ts_low), pkt_data
+
     def __iter__(self):
         while 1:
-            buf = self.__f.read(8)
-            if len(buf) < 8:
+            read = self.__read_block()
+            if read is None:
                 break
+            offset, blk_type, blk_len, buf, fatal = read
 
-            blk_type, blk_len = struct_unpack('<II' if self.__le else '>II', buf)
-            buf += self.__f.read(blk_len - 8)
+            if blk_type == PCAPNG_BT_EPB or blk_type == PCAPNG_BT_PB:
+                kls = (EnhancedPacketBlockLE if self.__le else EnhancedPacketBlock) \
+                    if blk_type == PCAPNG_BT_EPB else \
+                    (PacketBlockLE if self.__le else PacketBlock)
+                try:
+                    blk = kls(buf)
+                    ts = self.__ts_from_fields(blk.ts_high, blk.ts_low)
+                    pkt_data = blk.pkt_data
+                except (dpkt.NeedData, dpkt.UnpackError, UnicodeDecodeError) as e:
+                    # bad options (e.g. non UTF-8 comment) or mismatched
+                    # length fields: hand over the packet data anyway. A
+                    # truncated block already recorded its problem while
+                    # reading, so don't log the same offset twice.
+                    if not fatal:
+                        self.errors.append(ReaderError(
+                            offset, 'corrupt %s: %s' % (kls.__name__, e)))
+                    salvaged = self.__salvage_packet(
+                        offset, buf, already_recorded=fatal)
+                    if salvaged is None:
+                        # nothing recoverable; a fatal boundary means we are done
+                        if fatal:
+                            break
+                        continue
+                    ts, pkt_data = salvaged
 
-            if blk_type == PCAPNG_BT_EPB:
-                epb = EnhancedPacketBlockLE(buf) if self.__le else EnhancedPacketBlock(buf)
-                ts = self._tsoffset + (((epb.ts_high << 32) | epb.ts_low) / self._divisor)
-                yield (ts, epb.pkt_data)
-            elif blk_type == PCAPNG_BT_PB:
-                pb = PacketBlockLE(buf) if self.__le else PacketBlock(buf)
-                ts = self._tsoffset + (((pb.ts_high << 32) | pb.ts_low) / self._divisor)
-                yield (ts, pb.pkt_data)
+                yield (ts, pkt_data)
 
-            # just ignore other blocks
+                if fatal:
+                    # truncated block at EOF, the packet above is all that was
+                    # recoverable and no further boundary can be located
+                    break
 
+            elif blk_type == PCAPNG_BT_SPB:
+                # Simple Packet Block carries no timestamp. Per the spec the
+                # captured length is min(orig_len, snaplen); the block then
+                # pads it to a 32-bit boundary.
+                orig_len = struct_unpack(self.__endian + 'I', buf[8:12])[0]
+                po = 8 + self._SPB_FIXED_HDR_LEN
+                if fatal:
+                    # truncated block: padding/trailer may be missing, so
+                    # return the bytes actually present (at most orig_len)
+                    pkt_data = buf[po:po + min(orig_len, len(buf) - po)]
+                else:
+                    snaplen = self.snaplen if self.snaplen else orig_len
+                    captured = min(orig_len, snaplen)
+                    # tolerate a writer that padded a different length: never
+                    # read past the block's payload region
+                    end = min(po + _align32b(captured), blk_len - 4)
+                    pkt_data = buf[po:po + min(captured, end - po)]
+                yield (0, pkt_data)
+                if fatal:
+                    break
+
+            else:
+                # unknown / non-packet block (SHB, IDB, ...): just skip it
+                if fatal:
+                    break
 
 #########
 # TESTS #
@@ -1521,3 +1682,205 @@ def test_posttest():
         fun()
     except Exception as e:
         assert str(e) == 'No test type specified'
+
+
+# ---------------------------------------------------------------------------
+# resilience tests: corrupt blocks, truncated captures and Simple Packet Blocks
+# ---------------------------------------------------------------------------
+
+def _ng_shb():
+    """Minimal little-endian SHB (no options, sec_len = -1)."""
+    # the block is little-endian, so the BOM field holds the LE constant
+    body = struct_pack('<IHHq', BYTE_ORDER_MAGIC, PCAPNG_VERSION_MAJOR,
+                       PCAPNG_VERSION_MINOR, -1)
+    total = 12 + len(body)
+    return struct_pack('<II', PCAPNG_BT_SHB, total) + body + struct_pack('<I', total)
+
+
+def _ng_idb(linktype=DLT_EN10MB, snaplen=0xffff):
+    body = struct_pack('<HHI', linktype, 0, snaplen)
+    total = 12 + len(body)
+    return struct_pack('<II', PCAPNG_BT_IDB, total) + body + struct_pack('<I', total)
+
+
+def _ng_epb(pkt, ts_high=0, ts_low=0, bad_comment=False, bad_trailer=False):
+    cap = len(pkt)
+    pad = (-cap) % 4
+    opts = b''
+    if bad_comment:
+        cdata = b'\xff\xfe\xfd'  # invalid UTF-8
+        opts += struct_pack('<HH', PCAPNG_OPT_COMMENT, len(cdata)) + cdata + b'\x00'
+    opts += struct_pack('<HH', PCAPNG_OPT_ENDOFOPT, 0)
+    body = struct_pack('<IIII', 0, ts_high, ts_low, cap) + struct_pack('<I', cap)
+    body += pkt + b'\x00' * pad + opts
+    total = 12 + len(body)
+    out = struct_pack('<II', PCAPNG_BT_EPB, total) + body
+    out += struct_pack('<I', 0 if bad_trailer else total)
+    return out
+
+
+def _ng_spb(pkt, orig_len=None):
+    orig_len = len(pkt) if orig_len is None else orig_len
+    pad = (-len(pkt)) % 4
+    body = struct_pack('<I', orig_len) + pkt + b'\x00' * pad
+    total = 12 + len(body)
+    return struct_pack('<II', PCAPNG_BT_SPB, total) + body + struct_pack('<I', total)
+
+
+def test_reader_clean_file_no_errors():
+    fobj = BytesIO(_ng_shb() + _ng_idb() + _ng_epb(b'foo', 1, 2))
+    reader = Reader(fobj)
+    ts, pkt = next(iter(reader))
+    assert pkt == b'foo'
+    assert ts == ((1 << 32) | 2) / 1000000
+    assert reader.errors == []
+
+
+def test_reader_spb_is_yielded_with_zero_ts():
+    """SPB packets must no longer be silently skipped; ts defaults to 0."""
+    pkt = b'HIDDEN'
+    raw = _ng_shb() + _ng_idb() + _ng_spb(pkt)
+    reader = Reader(BytesIO(raw))
+    assert reader.readpkts() == [(0, pkt)]
+    assert reader.errors == []
+
+
+def test_reader_spb_between_epbs():
+    """A packet hidden inside an SPB among EPBs must surface."""
+    raw = (_ng_shb() + _ng_idb() + _ng_epb(b'epb1') +
+           _ng_spb(b'HIDDEN') + _ng_epb(b'epb2'))
+    reader = Reader(BytesIO(raw))
+    pkts = [p for _, p in reader.readpkts()]
+    assert pkts == [b'epb1', b'HIDDEN', b'epb2']
+
+
+def test_reader_spb_strips_padding():
+    pkt = b'\x08\x00\x27\x96' + b'XYZ'  # 7 bytes, padded to 8
+    raw = _ng_shb() + _ng_idb() + _ng_spb(pkt)
+    reader = Reader(BytesIO(raw))
+    assert reader.readpkts() == [(0, pkt)]
+
+
+def test_reader_bad_comment_still_delivers_packet():
+    prefix = _ng_shb() + _ng_idb()
+    good = _ng_epb(b'good')
+    bad = _ng_epb(b'bad-comment-pkt', bad_comment=True)
+    after = _ng_epb(b'after')
+    reader = Reader(BytesIO(prefix + good + bad + after))
+    pkts = [p for _, p in reader.readpkts()]
+    assert pkts == [b'good', b'bad-comment-pkt', b'after']
+    assert len(reader.errors) == 1
+    assert reader.errors[0].offset == len(prefix) + len(good)
+
+
+def test_reader_trailer_mismatch_recovers():
+    prefix = _ng_shb() + _ng_idb()
+    bad = _ng_epb(b'trailer-pkt', bad_trailer=True)
+    good = _ng_epb(b'recovered')
+    reader = Reader(BytesIO(prefix + bad + good))
+    pkts = [p for _, p in reader.readpkts()]
+    assert pkts == [b'trailer-pkt', b'recovered']
+    assert len(reader.errors) == 1
+
+
+def test_reader_bad_block_length_stops():
+    prefix = _ng_shb() + _ng_idb()
+    good = _ng_epb(b'before')
+    bad = struct_pack('<II', PCAPNG_BT_EPB, 4) + b'\x00' * 8  # len < 12
+    reader = Reader(BytesIO(prefix + good + bad))
+    pkts = [p for _, p in reader.readpkts()]
+    assert pkts == [b'before']
+    assert len(reader.errors) == 1
+    assert reader.errors[0].offset == len(prefix) + len(good)
+
+
+def test_reader_truncated_epb_returns_partial():
+    prefix = _ng_shb() + _ng_idb()
+    good = _ng_epb(b'before')
+    epb = _ng_epb(b'A' * 40)
+    cut = epb[:28 + 5]  # full fixed header, only 5 of 40 packet bytes
+    reader = Reader(BytesIO(prefix + good + cut))
+    pkts = [p for _, p in reader.readpkts()]
+    assert pkts[0] == b'before'
+    assert pkts[1] == b'AAAAA'
+    assert len(reader.errors) == 1
+    assert reader.errors[0].offset == len(prefix) + len(good)
+
+
+def test_reader_truncated_spb_returns_partial():
+    prefix = _ng_shb() + _ng_idb()
+    spb = _ng_spb(b'B' * 16)
+    cut = spb[:12 + 6]  # fixed header + 6 bytes, trailer missing
+    reader = Reader(BytesIO(prefix + cut))
+    assert reader.readpkts() == [(0, b'B' * 6)]
+    assert len(reader.errors) == 1
+
+
+def test_reader_corrupt_idb_fallback():
+    """An IDB with a mismatched trailing length still yields a usable IDB."""
+    shb, idb = _ng_shb(), _ng_idb()
+    broken_idb = idb[:-4] + b'\x00\x00\x00\x00'
+    reader = Reader(BytesIO(shb + broken_idb + _ng_epb(b'pkt')))
+    assert [p for _, p in reader.readpkts()] == [b'pkt']
+    assert reader.datalink() == DLT_EN10MB
+    assert len(reader.errors) == 1
+
+
+def test_reader_sll2_dloff_matches_pcap():
+    """The same linktype must give the same dloff in both formats."""
+    from .pcap import DLT_LINUX_SLL2 as PCAP_SLL2, Reader as PcapReader, TCPDUMP_MAGIC
+    ng_reader = Reader(BytesIO(_ng_shb() + _ng_idb(linktype=PCAP_SLL2)))
+    pcap_fh = struct_pack('<IHHIIII', TCPDUMP_MAGIC, 2, 4, 0, 0, 0xffff, PCAP_SLL2)
+    pcap_reader = PcapReader(BytesIO(pcap_fh))
+    assert ng_reader.dloff == pcap_reader.dloff == 20
+
+
+def _ng_pb(pkt, bad_comment=False):
+    """Little-endian deprecated Packet Block."""
+    cap = len(pkt)
+    pad = (-cap) % 4
+    opts = b''
+    if bad_comment:
+        cdata = b'\xff\xff'
+        opts += struct_pack('<HH', PCAPNG_OPT_COMMENT, len(cdata)) + cdata + b'\x00\x00'
+    opts += struct_pack('<HH', PCAPNG_OPT_ENDOFOPT, 0)
+    # iface_id(H) drops(H) ts_high ts_low caplen pkt_len
+    body = struct_pack('<HHIII', 0, 0, 11, 12, cap) + struct_pack('<I', cap)
+    body += pkt + b'\x00' * pad + opts
+    total = 12 + len(body)
+    return struct_pack('<II', PCAPNG_BT_PB, total) + body + struct_pack('<I', total)
+
+
+def test_reader_pb_bad_comment_salvaged():
+    raw = _ng_shb() + _ng_idb() + _ng_pb(b'PB-DATA', bad_comment=True)
+    reader = Reader(BytesIO(raw))
+    ts, pkt = reader.readpkts()[0]
+    assert pkt == b'PB-DATA'
+    assert ts == ((11 << 32) | 12) / 1000000
+    assert len(reader.errors) == 1
+
+
+def test_reader_big_endian_bad_comment_recovered():
+    """The salvage path must honour the section's byte order."""
+    shb_body = struct_pack('>IHHq', BYTE_ORDER_MAGIC, PCAPNG_VERSION_MAJOR,
+                           PCAPNG_VERSION_MINOR, -1)
+    shb = struct_pack('>II', PCAPNG_BT_SHB, 28) + shb_body + struct_pack('>I', 28)
+    idb_body = struct_pack('>HHI', DLT_EN10MB, 0, 0xffff)
+    idb = struct_pack('>II', PCAPNG_BT_IDB, 20) + idb_body + struct_pack('>I', 20)
+
+    pkt = b'BE-PKT'
+    cap = len(pkt)
+    pad = (-cap) % 4
+    cdata = b'\xff\xfe\xfd'
+    opts = struct_pack('>HH', PCAPNG_OPT_COMMENT, len(cdata)) + cdata + b'\x00'
+    opts += struct_pack('>HH', PCAPNG_OPT_ENDOFOPT, 0)
+    body = struct_pack('>IIII', 0, 7, 8, cap) + struct_pack('>I', cap)
+    body += pkt + b'\x00' * pad + opts
+    total = 12 + len(body)
+    epb = struct_pack('>II', PCAPNG_BT_EPB, total) + body + struct_pack('>I', total)
+
+    reader = Reader(BytesIO(shb + idb + epb))
+    ts, out = reader.readpkts()[0]
+    assert out == pkt
+    assert ts == ((7 << 32) | 8) / 1000000
+    assert len(reader.errors) == 1

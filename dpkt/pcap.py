@@ -147,6 +147,21 @@ dltoff = {DLT_NULL: 4, DLT_EN10MB: 14, DLT_IEEE802: 22, DLT_ARCNET: 6,
           DLT_LOOP: 4, DLT_LINUX_SLL: 16, DLT_LINUX_SLL2: 20}
 
 
+class ReaderError(dpkt.Error):
+    """A recoverable parse error collected in ``Reader.errors``.
+
+    Attributes:
+        offset: absolute offset of the offending record (or the file position
+            at which the problem was detected) within the capture file
+        reason: human readable description of the problem
+    """
+
+    def __init__(self, offset, reason):
+        self.offset = offset
+        self.reason = reason
+        super(ReaderError, self).__init__('offset %d: %s' % (offset, reason))
+
+
 class PktHdr(dpkt.Packet):
     """pcap packet header.
 
@@ -329,7 +344,6 @@ class Reader(object):
 
         self.__ph = MAGIC_TO_PKT_HDR[magic]
 
-
         if self.__fh.linktype in dltoff:
             self.dloff = dltoff[self.__fh.linktype]
         else:
@@ -337,6 +351,8 @@ class Reader(object):
         self._divisor = Decimal('1E9') if magic in (TCPDUMP_MAGIC_NANO, PMUDPCT_MAGIC_NANO) else 1E6
         self.snaplen = self.__fh.snaplen
         self.filter = ''
+        # non-fatal parse problems encountered while iterating the file
+        self.errors = []
         self.__iter = iter(self)
 
     @property
@@ -391,12 +407,36 @@ class Reader(object):
 
     def __iter__(self):
         while 1:
+            # absolute offset of the record about to be read
+            offset = self.__f.tell()
             buf = self.__f.read(self.__ph.__hdr_len__)
             if not buf:
                 break
+            if len(buf) < self.__ph.__hdr_len__:
+                # truncated packet header: the record length is unknowable,
+                # so no further boundary can be located
+                self.errors.append(ReaderError(
+                    offset,
+                    'truncated packet header: got %d bytes, expected %d'
+                    % (len(buf), self.__ph.__hdr_len__)))
+                break
+
             hdr = self.__ph(buf)
             buf = self.__f.read(hdr.caplen)
-            yield (hdr.tv_sec + (hdr.tv_usec / self._divisor), buf)
+            ts = hdr.tv_sec + (hdr.tv_usec / self._divisor)
+
+            if len(buf) < hdr.caplen:
+                # truncated record: return the bytes actually captured,
+                # record the problem, and stop since the next record's
+                # boundary can no longer be determined
+                self.errors.append(ReaderError(
+                    offset,
+                    'truncated packet data: got %d bytes, expected %d'
+                    % (len(buf), hdr.caplen)))
+                yield (ts, buf)
+                break
+
+            yield (ts, buf)
 
 
 class UniversalReader(object):
@@ -714,3 +754,70 @@ def test_universal_reader():
     fobj = BytesIO(b'\x42' * 1000)
     with pytest.raises(ValueError):
         reader = UniversalReader(fobj)
+
+
+def _le_pcap(records, linktype=DLT_EN10MB):
+    """Build a little-endian pcap file from (sec, usec, pkt) records."""
+    import struct
+    out = struct.pack('<IHHIIII', TCPDUMP_MAGIC, 2, 4, 0, 0, 0xffff, linktype)
+    for sec, usec, pkt in records:
+        out += struct.pack('<IIII', sec, usec, len(pkt), len(pkt)) + pkt
+    return out
+
+
+def test_reader_errors_empty_on_clean_file():
+    from .compat import BytesIO
+    reader = Reader(BytesIO(_le_pcap([(100, 5, b'AAAA')])))
+    assert reader.errors == []
+    assert reader.readpkts() == [(100.000005, b'AAAA')]
+
+
+def test_reader_truncated_record_data():
+    """A truncated record still yields its captured bytes, logs an error, stops."""
+    from .compat import BytesIO
+    data = _le_pcap([(100, 5, b'AAAA'), (200, 7, b'BBBBBB')])
+    # caplen of the second record says 6, but only 2 bytes remain
+    cut = data[:-4]
+    reader = Reader(BytesIO(cut))
+    pkts = reader.readpkts()
+
+    assert pkts[0] == (100.000005, b'AAAA')
+    assert pkts[1] == (200.000007, b'BB')
+    assert len(reader.errors) == 1
+    err = reader.errors[0]
+    assert err.offset == 24 + 16 + 4  # absolute offset of the second record
+    assert isinstance(err.reason, str) and 'truncated' in err.reason
+
+
+def test_reader_truncated_record_header():
+    """A partial record header cannot locate a boundary: log and stop."""
+    from .compat import BytesIO
+    data = _le_pcap([(100, 5, b'AAAA'), (200, 7, b'BBBBBB')])
+    cut = data[:-10]  # only 6 of the second 16-byte header remain
+    reader = Reader(BytesIO(cut))
+    pkts = reader.readpkts()
+
+    assert pkts == [(100.000005, b'AAAA')]
+    assert len(reader.errors) == 1
+    assert reader.errors[0].offset == 44
+    assert 'header' in reader.errors[0].reason
+
+
+def test_reader_bad_caplen_does_not_raise():
+    """A lying caplen must not crash the reader."""
+    from .compat import BytesIO
+    import struct
+    buf = struct.pack('<IHHIIII', TCPDUMP_MAGIC, 2, 4, 0, 0, 0xffff, DLT_EN10MB)
+    buf += struct.pack('<IIII', 100, 0, 0x10000, 4) + b'AAAA'
+    reader = Reader(BytesIO(buf))
+    pkts = reader.readpkts()
+    assert pkts[0][1] == b'AAAA'      # available bytes still returned
+    assert len(reader.errors) == 1
+    assert reader.errors[0].offset == 24
+
+
+def test_reader_sll2_dloff():
+    """SLL2 must resolve to a 20-byte data-link offset."""
+    from .compat import BytesIO
+    reader = Reader(BytesIO(_le_pcap([], linktype=DLT_LINUX_SLL2)))
+    assert reader.dloff == 20
