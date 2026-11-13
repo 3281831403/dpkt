@@ -64,12 +64,88 @@ DNS_HESIOD = 4
 DNS_ANY = 255
 
 
+def _escape_label(label):
+    """Encode a raw wire-format label as its RFC 3597 presentation form.
+
+    Valid UTF-8 text is kept readable; dots, backslashes and every byte that
+    is not printable as part of a name is escaped so the representation stays
+    lossless and unambiguous.
+    """
+    try:
+        text = codecs.decode(label, 'utf-8')
+    except UnicodeDecodeError:
+        text = None
+    if text is not None and all(ch >= u'!' for ch in text):
+        # Whole label is valid UTF-8 made of printable characters, so its
+        # characters round-trip exactly; only the RFC 1035 escapes are needed.
+        return text.replace('\\', '\\\\').replace('.', '\\.')
+    # Mixed/invalid encoding: escape each non-printable byte as \\DDD while
+    # keeping printable ASCII verbatim, so no byte is ever lost.
+    escaped = []
+    for byte in label:
+        if byte in (0x2e, 0x5c):  # '.' or '\\', the RFC 1035 escapes
+            escaped.append(b'\\' + struct.pack('B', byte))
+        elif 0x21 <= byte <= 0x7e:
+            escaped.append(struct.pack('B', byte))
+        else:
+            escaped.append(b'\\%03d' % byte)
+    return codecs.decode(b''.join(escaped), 'ascii')
+
+
+def _unescape_name(name):
+    """Parse an RFC 1035/3597 presentation-format name into raw wire labels.
+
+    Supports the '\\.' and '\\\\' escapes and the '\\DDD' three-digit decimal
+    escape, which together allow any byte value (including embedded dots and
+    non-UTF-8 bytes) to be represented without loss.
+    """
+    if isinstance(name, str):
+        name = codecs.encode(name, 'utf-8', 'surrogateescape')
+    labels = []
+    label = bytearray()
+    i = 0
+    while i < len(name):
+        byte = name[i]
+        if byte == 0x5c:  # backslash
+            i += 1
+            if i >= len(name):
+                raise dpkt.PackError('trailing escape in name %r' % name)
+            if 0x30 <= name[i] <= 0x39:  # '\\DDD' decimal escape
+                digits = name[i:i + 3]
+                if len(digits) < 3 or not all(0x30 <= d <= 0x39 for d in digits):
+                    raise dpkt.PackError('invalid \\DDD escape in name %r' % name)
+                value = (compat_ord(digits[0]) - 0x30) * 100 + \
+                    (compat_ord(digits[1]) - 0x30) * 10 + \
+                    (compat_ord(digits[2]) - 0x30)
+                if value > 255:
+                    raise dpkt.PackError('\\DDD escape out of range in name %r' % name)
+                label.append(value)
+                i += 3
+                continue
+            else:
+                label.append(name[i])
+                i += 1
+                continue
+        elif byte == 0x2e:  # unescaped dot separates labels
+            labels.append(bytes(label))
+            label = bytearray()
+            i += 1
+        else:
+            label.append(byte)
+            i += 1
+    labels.append(bytes(label))
+    for label in labels:
+        if len(label) > 63:
+            raise dpkt.PackError('label longer than 63 bytes')
+    if sum(len(label) + 1 for label in labels) > 255:
+        raise dpkt.PackError('name longer than 255 bytes')
+    return labels
+
+
 def pack_name(name, off, label_ptrs):
-    name = codecs.encode(name, 'utf-8')
-    if name:
-        labels = name.split(b'.')
-    else:
-        labels = []
+    if isinstance(name, str):
+        name = codecs.encode(name, 'utf-8', 'surrogateescape')
+    labels = _unescape_name(name) if name else []
     labels.append(b'')
     buf = b''
     for i, label in enumerate(labels):
@@ -101,6 +177,8 @@ def unpack_name(buf, off):
             off += 1
             break
         elif (n & 0xc0) == 0xc0:
+            if off + 2 > len(buf):
+                raise dpkt.NeedData()
             ptr = struct.unpack('>H', buf[off:off + 2])[0] & 0x3fff
             if ptr >= start_off:
                 raise dpkt.UnpackError('Invalid label compression pointer')
@@ -110,6 +188,8 @@ def unpack_name(buf, off):
             start_off = off = ptr
         elif (n & 0xc0) == 0x00:
             off += 1
+            if off + n > len(buf):
+                raise dpkt.NeedData()
             name.append(buf[off:off + n])
             name_length += n + 1
             if name_length > 255:
@@ -119,7 +199,9 @@ def unpack_name(buf, off):
             raise dpkt.UnpackError('Invalid label length %02x' % n)
     if not saved_off:
         saved_off = off
-    return codecs.decode(b'.'.join(name), 'utf-8'), saved_off
+    # RFC 3597 presentation format: escape rather than fail on bytes that are
+    # not valid UTF-8, so every wire-format name round-trips losslessly.
+    return '.'.join(_escape_label(label) for label in name), saved_off
 
 
 class DNS(dpkt.Packet):
@@ -241,6 +323,33 @@ class DNS(dpkt.Packet):
     def rcode(self, v):
         self.op = (self.op & ~0xf) | (v & 0xf)
 
+    @property
+    def extended_rcode(self):
+        """Full 12-bit RCODE (RFC 6891).
+
+        The header carries the low 4 bits; the OPT meta-RR in the additional
+        section carries the upper 8 bits in the first byte of its TTL field.
+        """
+        rcode = self.rcode
+        for rr in self.ar:
+            if rr.type == DNS_OPT:
+                rcode |= (rr.ttl >> 24) << 4
+                break
+        return rcode
+
+    @extended_rcode.setter
+    def extended_rcode(self, v):
+        self.rcode = v & 0xf
+        upper = (v >> 4) & 0xff
+        for rr in self.ar:
+            if rr.type == DNS_OPT:
+                rr.ttl = (rr.ttl & 0x00ffffff) | (upper << 24)
+                break
+        else:
+            if upper:
+                raise dpkt.PackError(
+                    'extended RCODE 0x%x requires an OPT record' % v)
+
     class Q(dpkt.Packet):
         """DNS question."""
         __hdr__ = (
@@ -300,6 +409,11 @@ class DNS(dpkt.Packet):
                     pack_name(self.srvname, off + 6, label_ptrs)
             elif self.type == DNS_OPT:
                 return b''  # self.rdata
+            elif getattr(self, '_opaque_rdata', False):
+                # RFC 3597: an unknown RR type taken from the wire keeps its
+                # rdata opaque (even when empty) so the message writes back
+                # byte for byte. A hand-built RR without rdata still errors.
+                return self.rdata
             else:
                 raise dpkt.PackError('RR type %s is not supported' % self.type)
 
@@ -337,7 +451,9 @@ class DNS(dpkt.Packet):
             elif self.type == DNS_OPT:
                 pass  # RFC-6891: OPT is a pseudo-RR not carrying any DNS data
             else:
-                raise dpkt.UnpackError('RR type %s is not supported' % self.type)
+                # RFC 3597: unknown RR types are kept as opaque rdata and
+                # written back byte for byte instead of failing the parse.
+                self._opaque_rdata = True
 
     def pack_q(self, buf, q):
         """Append packed DNS question and return buf."""
@@ -347,6 +463,8 @@ class DNS(dpkt.Packet):
         """Return DNS question and new offset."""
         q = self.Q()
         q.name, off = unpack_name(buf, off)
+        if off + 4 > len(buf):
+            raise dpkt.NeedData()
         q.type, q.cls = struct.unpack('>HH', buf[off:off + 4])
         off += 4
         return q, off
@@ -361,8 +479,13 @@ class DNS(dpkt.Packet):
         """Return DNS RR and new offset."""
         rr = self.RR()
         rr.name, off = unpack_name(buf, off)
+        if off + 10 > len(buf):
+            raise dpkt.NeedData()
         rr.type, rr.cls, rr.ttl, rdlen = struct.unpack('>HHIH', buf[off:off + 10])
         off += 10
+        if rdlen > len(buf) - off:
+            raise dpkt.UnpackError(
+                'rdata length %d exceeds %d remaining bytes' % (rdlen, len(buf) - off))
         rr.rdata = buf[off:off + rdlen]
         rr.rlen = rdlen
         rr.unpack_rdata(buf, off)
@@ -601,6 +724,74 @@ def test_unpack_name():
     unpack_name(b' ', 0)
 
 
+def test_pack_name_escapes():
+    # RFC 1035: an escaped dot stays inside one label; RFC 3597 \DDD form
+    # round-trips arbitrary bytes without losing any of them.
+    wire = pack_name(r'a\.b\000e.com', 0, {})
+    assert wire == b'\x05a.b\x00e\x03com\x00'
+    name, _ = unpack_name(wire, 0)
+    assert name == r'a\.b\000e.com'
+    assert pack_name(name, 0, {}) == wire
+
+    # An escaped backslash stays inside the label as well.
+    wire = pack_name(r'a\\b', 0, {})
+    assert wire == b'\x03a\\b\x00'
+    name, _ = unpack_name(wire, 0)
+    assert name == r'a\\b'
+    assert pack_name(name, 0, {}) == wire
+
+
+def test_unpack_name_non_utf8():
+    # A label with raw non-UTF-8 bytes must not raise UnicodeDecodeError;
+    # the bytes survive as \DDD escapes and pack back to the same wire bytes.
+    wire = b'\x04ab\xffd\x03com\x00'
+    name, off = unpack_name(wire, 0)
+    assert name == r'ab\255d.com'
+    assert off == len(wire)
+    assert pack_name(name, 0, {}) == wire
+
+
+def test_unpack_name_utf8_preserved():
+    # Valid UTF-8 labels stay readable rather than being escaped.
+    wire = b'\x04\xc3\xa9\xc3\xa8\x00'  # 'éè'
+    name, _ = unpack_name(wire, 0)
+    assert name == u'éè'
+    assert pack_name(name, 0, {}) == wire
+
+
+def test_extended_rcode():
+    # RFC 6891: the OPT meta-RR contributes the upper 8 bits of the RCODE in
+    # the high byte of its TTL.
+    opt_buf = define_testdata().opt_resp
+    dns = DNS(opt_buf)
+    assert dns.rcode == 0
+    assert dns.extended_rcode == 0
+
+    # BADSIG = 16: low nibble 0 in the header, high byte 1 in OPT TTL.
+    opt = dns.ar[0]
+    low_ttl = opt.ttl & 0x00ffffff
+    opt.ttl = (1 << 24) | low_ttl
+    assert dns.extended_rcode == 16
+    dns2 = DNS(bytes(dns))
+    assert dns2.extended_rcode == 16
+    assert bytes(dns2) == bytes(dns)
+
+    dns.extended_rcode = 0
+    assert dns.extended_rcode == 0
+    assert dns.ar[0].ttl == low_ttl
+
+
+@TryExceptException(dpkt.PackError)
+def test_extended_rcode_without_opt():
+    # Upper RCODE bits cannot be stored when no OPT record is present.
+    dns = DNS()
+    dns.qd = [DNS.Q(name='example.com', type=DNS_A, cls=DNS_IN)]
+    dns.an = []
+    dns.ns = []
+    dns.ar = []
+    dns.extended_rcode = 16
+
+
 @TryExceptException(dpkt.UnpackError)
 def test_random_data():
     DNS(b'\x83z0\xd2\x9a\xec\x94_7\xf3\xb7+\x85"?\xf0\xfb')
@@ -789,7 +980,16 @@ def test_dns_len():
 
 @TryExceptException(dpkt.PackError)
 def test_rdata_FAIL():
+    # An RR whose type is not understood and which carries no opaque rdata
+    # still cannot be packed.
     DNS.RR(type=12345666).pack_rdata(0, {})
+
+
+def test_rdata_unknown_opaque():
+    # RFC 3597: an unknown RR type with opaque rdata packs that rdata as-is.
+    rr = DNS.RR(type=46, rdata=b'\x01\x02\x03\x04')
+    rr._opaque_rdata = True
+    assert rr.pack_rdata(0, {}) == b'\x01\x02\x03\x04'
 
 
 def test_soa():
@@ -930,7 +1130,41 @@ def test_cname():
     assert cname.ar == []
 
 
-@TryExceptException(dpkt.UnpackError)
 def test_invalid_rr():
+    # RFC 3597: an unknown RR type (here type 21 with empty rdata) must not
+    # break the whole message; the RR is retained with opaque rdata.
+    from binascii import unhexlify
     buf = define_testdata().invalid_rr
-    DNS(buf)
+    my_dns = DNS(buf)
+    rr = my_dns.an[0]
+    assert rr.type == 21 and rr.cls == DNS_IN and rr.rlen == 0
+    assert rr.rdata == b'' and my_dns.ns == [] and my_dns.ar == []
+
+    rrsig = unhexlify(
+        # id=0x1234, standard query flags, one question, one answer
+        "123401000001000100000000"
+        # question: example.com IN RRSIG(46)
+        "076578616d706c6503636f6d00002e0001"
+        # answer: example.com IN RRSIG, ttl=300, rdlen=12, opaque rdata
+        "c00c002e00010000012c000c"
+        "0102030405060708090a0b0c"
+    )
+    my_dns = DNS(rrsig)
+    answer = my_dns.an[0]
+    assert answer.type == 46
+    assert answer.rlen == 12
+    assert answer.rdata == unhexlify("0102030405060708090a0b0c")
+    assert bytes(my_dns) == rrsig
+
+
+@TryExceptException(dpkt.UnpackError)
+def test_rdata_truncated():
+    # rdlen claiming more bytes than the message contains is an UnpackError,
+    # not silently truncated rdata.
+    from binascii import unhexlify
+    DNS(unhexlify(
+        "123401000001000100000000"
+        "076578616d706c6503636f6d0000010001"
+        # answer: A record claiming rdlen=4 with only 2 bytes left
+        "c00c000100010000012c00040102"
+    ))
