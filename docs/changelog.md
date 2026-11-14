@@ -1,5 +1,9 @@
 # Changelog
 
+## Unreleased
+- Added `dpkt.ipfrag.IPFragmentReassembler`: reassembles IPv4 and IPv6 fragments (out-of-order, duplicate and overlapping), recomputes the length fields and checksums of the whole datagram, and records gaps, overlaps and oversized datagrams as errors with a reason and an offset
+- Fixed `IP6.unpack` decoding non-first fragments whose Fragment Header follows another extension header (e.g. Hop-by-Hop) as transport packets
+
 ## 1.9.8
 **[2022-08-17]**
 - Fixed endianness issues in PCAPNG, Loopback

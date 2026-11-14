@@ -93,7 +93,10 @@ class IP6(dpkt.Packet):
 
         # do not decode fragments after the first fragment
         # https://github.com/kbandla/dpkt/issues/575
-        if self.nxt == 44 and ext.frag_off > 0:  # 44 = IP_PROTO_FRAGMENT
+        # The fragment header may follow other extension headers, so look it
+        # up in the chain instead of only checking the fixed header's nxt.
+        fragment_hdr = self.extension_hdrs.get(ip.IP_PROTO_FRAGMENT)
+        if fragment_hdr is not None and fragment_hdr.frag_off > 0:
             self.data = buf
             return
 
@@ -587,3 +590,24 @@ def test_ip6_fragment_no_decode():  # https://github.com/kbandla/dpkt/issues/575
 
     # test packing
     assert bytes(frag2) == s
+
+
+def test_ip6_fragment_behind_hopopts_no_decode():
+    # The Fragment Header follows a Hop-by-Hop header, so it is not the
+    # fixed header's nxt.  A non-first fragment must still be left raw:
+    # decoding its first bytes as a transport header is what used to
+    # happen here (https://github.com/kbandla/dpkt/issues/575).
+    s = (b'\x60\x00\x00\x00\x00\x20\x00\x40'
+         b'\x20\x01\x0d\xb8\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x01'
+         b'\x20\x01\x0d\xb8\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x02'
+         b'\x2c\x00\x00\x00\x00\x00\x00\x00'   # Hop-by-Hop -> Fragment
+         b'\x11\x00\x00\x19\x00\x00\x11\x11'   # UDP, offset 24, MF
+         b'\x38\x39\x3a\x3b\x3c\x3d\x3e\x3f\x40\x41\x42\x43\x44\x45\x46\x47')
+    frag = IP6(s)
+    assert ip.IP_PROTO_HOPOPTS in frag.extension_hdrs
+    frag_hdr = frag.extension_hdrs[ip.IP_PROTO_FRAGMENT]
+    assert frag_hdr.frag_off == 3
+    assert frag_hdr.nxt == ip.IP_PROTO_UDP
+    # the payload is partial data, not a UDP header
+    assert type(frag.data) == bytes
+    assert frag.data == b'\x38\x39\x3a\x3b\x3c\x3d\x3e\x3f@ABCDEFG'
